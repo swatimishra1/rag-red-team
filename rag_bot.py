@@ -21,7 +21,12 @@ from openai import OpenAI
 
 DB_DIR = "chroma_db"
 COLLECTION_NAME = "help_center"
-MODEL = "llama-3.3-70b-versatile"
+# Originally built against Llama 3.3 70B, which Groq has since retired.
+# Groq periodically renames/retires model IDs — if you hit a 404
+# "model_not_found" error, run list_groq_models.py to see what your key
+# currently has access to, then either update the default below or just
+# set GROQ_MODEL as an env var without touching this file.
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 RELEVANCE_THRESHOLD = 0.5  # similarity below this = "not relevant"
 TOP_K = 3
 
@@ -40,22 +45,44 @@ with open("system_prompt.txt", "r", encoding="utf-8") as f:
 
 
 def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
-    """Return top_k chunks with cosine similarity scores (higher = closer)."""
-    results = _collection.query(query_texts=[query], n_results=top_k)
+    """
+    Return top_k chunks with cosine similarity scores (higher = closer).
 
-    hits = []
+    Fix for the conflicting-sources failure (test 3): raw cosine similarity
+    has no notion of document freshness, so a superseded doc can legitimately
+    outrank the current one on wording alone (that's exactly what happened —
+    refund-policy-2022-legacy.md scored 0.663 vs. 0.546 for the current doc).
+
+    To fix this at the retrieval layer rather than papering over it in the
+    prompt: pull a wider candidate pool, then rank current docs ahead of
+    superseded ones before truncating to top_k. A superseded chunk only
+    surfaces if there isn't enough current-doc content to fill top_k, and
+    it's still labeled in the debug output either way, so nothing is hidden
+    from the ranking logic.
+    """
+    # Widen the candidate pool so demoting superseded chunks doesn't just
+    # starve the LLM of context on topics where only a legacy doc exists.
+    pool_size = min(top_k * 3, _collection.count())
+    results = _collection.query(query_texts=[query], n_results=pool_size)
+
+    candidates = []
     for doc, meta, distance in zip(
         results["documents"][0],
         results["metadatas"][0],
         results["distances"][0],
     ):
         similarity = 1 - distance  # cosine distance -> similarity
-        hits.append({
+        candidates.append({
             "text": doc,
             "source": meta["source"],
+            "status": meta.get("status", "current"),
             "similarity": round(similarity, 3),
         })
-    return hits
+
+    # Stable sort: current docs first, then by similarity within each group.
+    candidates.sort(key=lambda c: (c["status"] == "superseded", -c["similarity"]))
+
+    return candidates[:top_k]
 
 
 def ask(query: str, conversation_history: list[dict] | None = None,
@@ -111,4 +138,4 @@ if __name__ == "__main__":
     print("ANSWER:\n", result["answer"])
     print("\nRETRIEVED:")
     for r in result["retrieved"]:
-        print(f"  {r['source']}  similarity={r['similarity']}")
+        print(f"  {r['source']}  similarity={r['similarity']}  status={r['status']}")
